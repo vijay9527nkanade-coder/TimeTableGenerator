@@ -313,21 +313,29 @@ class Assignment(models.Model):
 
 
 # ===========================================================================
-# 9. TimetableEntry (solver output)
+# 9. TimetableEntry (solver output + manually pinned entries)
 # ===========================================================================
 class TimetableEntry(models.Model):
     semester = models.ForeignKey(Semester, on_delete=models.CASCADE, related_name='timetable_entries')
     assignment = models.ForeignKey(Assignment, on_delete=models.CASCADE, related_name='timetable_entries')
     room = models.ForeignKey(Room, on_delete=models.CASCADE, related_name='timetable_entries')
     time_slot = models.ForeignKey(TimeSlot, on_delete=models.CASCADE, related_name='timetable_entries')
+    is_pinned = models.BooleanField(
+        default=False,
+        help_text=(
+            'Pinned entries are manually fixed and preserved during timetable regeneration. '
+            'The solver schedules all other lectures around them.'
+        )
+    )
 
     class Meta:
         unique_together = ('semester', 'time_slot', 'room')
         ordering = ['time_slot__day', 'time_slot__period_number']
 
     def __str__(self):
+        pin_tag = ' [PINNED]' if self.is_pinned else ''
         return (f"{self.time_slot} | {self.assignment.division.name} | "
-                f"{self.assignment.subject.name} | {self.assignment.teacher.name} | {self.room.name}")
+                f"{self.assignment.subject.name} | {self.assignment.teacher.name} | {self.room.name}{pin_tag}")
 
 
 # ===========================================================================

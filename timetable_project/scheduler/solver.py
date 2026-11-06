@@ -21,7 +21,11 @@ class TimetableSolverError(Exception):
 def generate_timetable(semester_id: int) -> dict:
     """
     Generates a conflict-free timetable for the given semester using Google OR-Tools CP-SAT.
-    
+
+    Pinned entries (is_pinned=True) are manually fixed lectures that are preserved across
+    regeneration. The solver treats pinned slots as already occupied and fills remaining
+    hours around them without touching them.
+
     Hard constraints:
       1. Teacher cannot be in two places at the same time slot.
       2. Division cannot have two subjects in the same time slot.
@@ -29,15 +33,17 @@ def generate_timetable(semester_id: int) -> dict:
       4. Lab subjects only in lab rooms; theory subjects only in non-lab rooms.
       5. Teacher is never scheduled during their TeacherUnavailability time slots.
       6. Scheduling only happens within existing TimeSlots.
-      7. For each assignment, scheduled_hours <= weekly_hours().
-      
+      7. For each assignment, solver_scheduled_hours <= remaining_weekly_hours
+         (after subtracting already-pinned hours).
+
     Soft objective:
       Maximize total scheduled hours across all assignments.
-      
+
     After solving:
-      - Clears previous TimetableEntry and SchedulingIssue rows for this semester.
-      - Saves new TimetableEntry rows.
-      - Creates SchedulingIssue rows for any assignment where scheduled_hours < weekly_hours().
+      - Clears only NON-PINNED TimetableEntry rows for this semester.
+      - Pinned entries are NEVER deleted or modified.
+      - Saves new solver TimetableEntry rows (is_pinned=False).
+      - Creates SchedulingIssue rows for any assignment where total hours < weekly_hours().
     """
     try:
         semester = Semester.objects.get(pk=semester_id)
@@ -78,6 +84,35 @@ def generate_timetable(semester_id: int) -> dict:
                 f"No regular room exists for '{a.subject.name}' -- add at least one Room with is_lab=False."
             )
 
+    # -------------------------------------------------------------------------
+    # Load Pinned Entries — these are FIXED and must not be touched by the solver
+    # -------------------------------------------------------------------------
+    pinned_entries = list(
+        TimetableEntry.objects.filter(semester=semester, is_pinned=True)
+        .select_related(
+            'assignment__teacher', 'assignment__subject',
+            'assignment__division', 'room', 'time_slot'
+        )
+    )
+
+    # Build "occupied" sets from pinned entries so solver avoids those slots
+    pinned_teacher_slots = set()   # (teacher_id, slot_id)
+    pinned_division_slots = set()  # (division_id, slot_id)
+    pinned_room_slots = set()      # (room_id, slot_id)
+    pinned_hours_per_assignment = defaultdict(int)  # assignment_id -> count
+
+    for pe in pinned_entries:
+        t_id = pe.assignment.teacher.id
+        div_id = pe.assignment.division.id
+        r_id = pe.room.id
+        slot_id = pe.time_slot.id
+        a_id = pe.assignment.id
+
+        pinned_teacher_slots.add((t_id, slot_id))
+        pinned_division_slots.add((div_id, slot_id))
+        pinned_room_slots.add((r_id, slot_id))
+        pinned_hours_per_assignment[a_id] += 1
+
     # Teacher unavailabilities map: teacher_id -> set of time_slot_ids
     unavailability_records = TeacherUnavailability.objects.all().values_list("teacher_id", "time_slot_id")
     teacher_unavail = defaultdict(set)
@@ -93,6 +128,7 @@ def generate_timetable(semester_id: int) -> dict:
     # Only create variable if:
     # 1. room type matches subject type (lab vs theory)
     # 2. teacher is available in that slot
+    # 3. slot is NOT already occupied by a pinned entry for this teacher/division/room
     x = {}
 
     # Index structures for fast constraint posting
@@ -109,11 +145,26 @@ def generate_timetable(semester_id: int) -> dict:
 
         for slot in time_slots:
             slot_id = slot.id
+
+            # Skip: teacher unavailable
             if slot_id in teacher_unavail[t_id]:
-                continue  # Constraint 5: Teacher unavailable
+                continue
+
+            # Skip: slot already occupied by a pinned entry for this teacher
+            if (t_id, slot_id) in pinned_teacher_slots:
+                continue
+
+            # Skip: slot already occupied by a pinned entry for this division
+            if (div_id, slot_id) in pinned_division_slots:
+                continue
 
             for r in matching_rooms:
                 r_id = r.id
+
+                # Skip: room already occupied by a pinned entry
+                if (r_id, slot_id) in pinned_room_slots:
+                    continue
+
                 var_name = f"x_{a.id}_{r_id}_{slot_id}"
                 var = model.NewBoolVar(var_name)
 
@@ -136,19 +187,28 @@ def generate_timetable(semester_id: int) -> dict:
     for (r_id, slot_id), var_list in room_slot_vars.items():
         model.Add(sum(var_list) <= 1)
 
-    # Constraint 7: Scheduled hours <= weekly_hours() for each assignment
+    # Constraint 7: Solver scheduled hours <= remaining weekly hours for each assignment
+    # (remaining = weekly_hours() - pinned_hours already in DB)
     total_requested_hours = 0
     for a in assignments:
         req_hours = a.weekly_hours()
         total_requested_hours += req_hours
+        already_pinned = pinned_hours_per_assignment[a.id]
+        remaining_needed = max(0, req_hours - already_pinned)
         if a.id in assignment_vars:
-            model.Add(sum(assignment_vars[a.id]) <= req_hours)
+            model.Add(sum(assignment_vars[a.id]) <= remaining_needed)
 
     # Additional constraint: Teacher max hours per week
+    # (pinned hours count toward the max too)
     for t_id, var_list in teacher_all_vars.items():
         teacher_obj = next((a.teacher for a in assignments if a.teacher.id == t_id), None)
         if teacher_obj and teacher_obj.max_hours_per_week:
-            model.Add(sum(var_list) <= teacher_obj.max_hours_per_week)
+            # Count how many pinned hours this teacher already has
+            pinned_teacher_hours = sum(
+                1 for pe in pinned_entries if pe.assignment.teacher.id == t_id
+            )
+            remaining_max = max(0, teacher_obj.max_hours_per_week - pinned_teacher_hours)
+            model.Add(sum(var_list) <= remaining_max)
 
     # Soft Objective: Maximize total scheduled hours across all assignments
     all_vars = list(x.values())
@@ -157,7 +217,6 @@ def generate_timetable(semester_id: int) -> dict:
 
     # Solve
     solver = cp_model.CpSolver()
-    # Parameters for solver responsiveness
     solver.parameters.max_time_in_seconds = 30.0
     solver.parameters.num_workers = 4
 
@@ -188,12 +247,21 @@ def generate_timetable(semester_id: int) -> dict:
                     assignment=assignment_dict[a_id],
                     room=room_dict[r_id],
                     time_slot=slot_dict[slot_id],
+                    is_pinned=False,  # Solver-generated entries are never pinned
                 )
             )
             assignment_scheduled_count[a_id] += 1
 
-    total_scheduled_hours = len(scheduled_entries)
+    # Total scheduled = solver entries + pinned entries (pinned count toward hours)
+    total_solver_hours = len(scheduled_entries)
+    total_pinned_hours = len(pinned_entries)
+    total_scheduled_hours = total_solver_hours + total_pinned_hours
+
     scheduling_issues = []
+
+    # Include pinned hours in per-assignment scheduled count for issue detection
+    for a_id, count in pinned_hours_per_assignment.items():
+        assignment_scheduled_count[a_id] += count
 
     # Calculate division-level and teacher-level totals for intelligent diagnostics
     div_requested_totals = defaultdict(int)
@@ -264,21 +332,24 @@ def generate_timetable(semester_id: int) -> dict:
             )
 
     with transaction.atomic():
-        # Clear existing entries and issues for this semester
-        TimetableEntry.objects.filter(semester=semester).delete()
+        # Only delete NON-PINNED entries — pinned entries are preserved!
+        TimetableEntry.objects.filter(semester=semester, is_pinned=False).delete()
         SchedulingIssue.objects.filter(semester=semester).delete()
 
-        # Bulk create new entries and issues
+        # Bulk create new solver-generated entries and issues
         TimetableEntry.objects.bulk_create(scheduled_entries)
         SchedulingIssue.objects.bulk_create(scheduling_issues)
 
+    pinned_count = len(pinned_entries)
     return {
         "success": True,
         "total_hours_scheduled": total_scheduled_hours,
         "total_hours_requested": total_requested_hours,
+        "pinned_count": pinned_count,
         "issues_count": len(scheduling_issues),
         "message": (
             f"Successfully generated timetable with {total_scheduled_hours}/{total_requested_hours} "
-            f"hours scheduled ({len(scheduling_issues)} issues reported)."
+            f"hours scheduled ({pinned_count} pinned + {total_solver_hours} auto-scheduled, "
+            f"{len(scheduling_issues)} issues reported)."
         )
     }

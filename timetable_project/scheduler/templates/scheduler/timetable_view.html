@@ -31,7 +31,7 @@
         </div>
 
         <div>
-          <label class="block text-[11px] font-semibold text-slate-600 uppercase mb-1">Year & Division</label>
+          <label class="block text-[11px] font-semibold text-slate-600 uppercase mb-1">Year &amp; Division</label>
           <select name="division_id" onchange="this.form.submit()" class="rounded-xl border border-slate-300 px-3 py-1.5 text-xs bg-white font-semibold focus:ring-2 focus:ring-indigo-500 outline-none">
             {% for d in divisions %}
             <option value="{{ d.id }}" {% if selected_division and selected_division.id == d.id %}selected{% endif %}>
@@ -52,8 +52,8 @@
     </div>
   </div>
 
-  <!-- Division Title Banner -->
   {% if selected_division %}
+  <!-- Division Title Banner -->
   <div class="flex items-center justify-between bg-indigo-900 text-white p-4 rounded-xl shadow-sm">
     <div class="flex items-center gap-3">
       <div class="w-10 h-10 rounded-lg bg-indigo-700/60 flex items-center justify-center font-bold text-lg">
@@ -66,7 +66,13 @@
         </p>
       </div>
     </div>
-    <div class="no-print">
+    <div class="no-print flex items-center gap-2">
+      <!-- Legend -->
+      <div class="hidden sm:flex items-center gap-3 text-[10px] text-indigo-200 mr-2">
+        <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-amber-400"></span> 📌 Pinned (Manual)</span>
+        <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-indigo-400"></span> Auto-Scheduled</span>
+        <span class="flex items-center gap-1"><span class="inline-block w-3 h-3 rounded bg-purple-400"></span> Lab</span>
+      </div>
       <a href="{% url 'scheduler:generate_timetable' %}?semester_id={{ selected_semester.id }}" class="text-xs bg-indigo-800 hover:bg-indigo-700 text-indigo-100 px-3 py-1.5 rounded-lg font-medium transition">
         <i class="fa-solid fa-wand-magic-sparkles mr-1"></i> Re-solve
       </a>
@@ -103,21 +109,28 @@
             <td class="p-2.5 border-r border-slate-200 last:border-0 align-top h-24 w-1/6">
               {% if cell.entry %}
               <div class="h-full rounded-xl p-2.5 flex flex-col justify-between border shadow-sm transition
-                {% if cell.entry.assignment.subject.is_lab %}
+                {% if cell.entry.is_pinned %}
+                  bg-amber-50/90 border-amber-300 text-amber-950
+                {% elif cell.entry.assignment.subject.is_lab %}
                   bg-purple-50/90 border-purple-200 text-purple-950
                 {% else %}
                   bg-indigo-50/90 border-indigo-200 text-indigo-950
                 {% endif %}">
 
-                <!-- Subject & Badge -->
+                <!-- Subject & Badges -->
                 <div>
                   <div class="flex items-center justify-between gap-1 mb-1">
                     <span class="font-bold text-xs leading-snug line-clamp-1">
                       {{ cell.entry.assignment.subject.name }}
                     </span>
-                    {% if cell.entry.assignment.subject.is_lab %}
-                    <span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-purple-200/80 text-purple-800 shrink-0">LAB</span>
-                    {% endif %}
+                    <div class="flex items-center gap-1 shrink-0">
+                      {% if cell.entry.is_pinned %}
+                      <span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-300/80 text-amber-900" title="Manually pinned — preserved during regeneration">📌</span>
+                      {% endif %}
+                      {% if cell.entry.assignment.subject.is_lab %}
+                      <span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-purple-200/80 text-purple-800">LAB</span>
+                      {% endif %}
+                    </div>
                   </div>
 
                   <!-- Teacher Name -->
@@ -128,7 +141,11 @@
                 </div>
 
                 <!-- Room Name -->
-                <div class="mt-2 pt-1 border-t {% if cell.entry.assignment.subject.is_lab %}border-purple-200/60 text-purple-800{% else %}border-indigo-200/60 text-indigo-800{% endif %} text-[10px] font-mono flex items-center justify-between">
+                <div class="mt-2 pt-1 border-t
+                  {% if cell.entry.is_pinned %}border-amber-200/60 text-amber-800
+                  {% elif cell.entry.assignment.subject.is_lab %}border-purple-200/60 text-purple-800
+                  {% else %}border-indigo-200/60 text-indigo-800{% endif %}
+                  text-[10px] font-mono flex items-center justify-between">
                   <span><i class="fa-solid fa-door-open mr-1"></i>{{ cell.entry.room.name }}</span>
                   <span class="text-[9px] text-slate-500">Cap: {{ cell.entry.room.capacity }}</span>
                 </div>
